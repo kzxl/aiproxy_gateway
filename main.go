@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -19,6 +20,21 @@ import (
 
 var db *sql.DB
 
+// Cost per 1 Token (Input + Output blended roughly) for MVP
+var ModelPricing = map[string]float64{
+	"gpt-3.5-turbo": 0.0000015,
+	"gpt-4o":        0.000005,
+	"gpt-4-turbo":   0.00001,
+	"claude-3-haiku-20240307": 0.00000125,
+}
+
+type OpenAIResponse struct {
+	Model string `json:"model"`
+	Usage struct {
+		TotalTokens int `json:"total_tokens"`
+	} `json:"usage"`
+}
+
 func initDB() {
 	var err error
 	db, err = sql.Open("sqlite", "aiproxy.db")
@@ -30,6 +46,8 @@ func initDB() {
 	CREATE TABLE IF NOT EXISTS prompt_cache (
 		hash_id TEXT PRIMARY KEY,
 		response_body TEXT,
+		model TEXT,
+		saved_usd REAL,
 		created_at INTEGER
 	);`
 	_, err = db.Exec(createTableQuery)
@@ -45,23 +63,34 @@ func calculateHash(body []byte) string {
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
-func getCache(hashID string) (string, bool) {
+func getCache(hashID string) (string, float64, bool) {
 	var responseBody string
-	query := `SELECT response_body FROM prompt_cache WHERE hash_id = ?`
-	err := db.QueryRow(query, hashID).Scan(&responseBody)
+	var savedUsd float64
+	query := `SELECT response_body, saved_usd FROM prompt_cache WHERE hash_id = ?`
+	err := db.QueryRow(query, hashID).Scan(&responseBody, &savedUsd)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return "", false
+			return "", 0, false
 		}
 		log.Printf("DB Error: %v", err)
-		return "", false
+		return "", 0, false
 	}
-	return responseBody, true
+	return responseBody, savedUsd, true
 }
 
 func saveCache(hashID string, responseBody string) {
-	query := `INSERT INTO prompt_cache (hash_id, response_body, created_at) VALUES (?, ?, ?)`
-	_, err := db.Exec(query, hashID, responseBody, time.Now().Unix())
+	// Parse usage tokens
+	var oaiResp OpenAIResponse
+	json.Unmarshal([]byte(responseBody), &oaiResp)
+
+	costPerToken, exists := ModelPricing[oaiResp.Model]
+	if !exists {
+		costPerToken = 0.000002 // default fallback
+	}
+	savedUsd := float64(oaiResp.Usage.TotalTokens) * costPerToken
+
+	query := `INSERT INTO prompt_cache (hash_id, response_body, model, saved_usd, created_at) VALUES (?, ?, ?, ?, ?)`
+	_, err := db.Exec(query, hashID, responseBody, oaiResp.Model, savedUsd, time.Now().Unix())
 	if err != nil {
 		log.Printf("Failed to cache prompt: %v", err)
 	}
@@ -81,15 +110,15 @@ func proxyToOpenAI(c *gin.Context) {
 
 	// 3. Search Cache
 	start := time.Now()
-	cachedResponse, found := getCache(hashID)
+	cachedResponse, savedUsd, found := getCache(hashID)
 	if found {
 		duration := time.Since(start).Milliseconds()
-		fmt.Printf("[\033[32mCACHE HIT\033[0m] Hash: %s | Time: %dms | \033[32mSAVED 💰\033[0m\n", hashID[:8], duration)
+		fmt.Printf("[\033[32mCACHE HIT\033[0m] Hash: %s | Time: %dms | \033[32mSAVED $%.6f 💰\033[0m\n", hashID[:8], duration, savedUsd)
 		c.Data(http.StatusOK, "application/json", []byte(cachedResponse))
 		return
 	}
 
-	// 4. Cache Miss -> Forward to OpenAI (Or MOCK if key is mock)
+	// 4. Cache Miss -> Forward to OpenAI
 	fmt.Printf("[\033[33mCACHE MISS\033[0m] Hash: %s | Forwarding to OpenAI...\n", hashID[:8])
 	
 	authHeader := c.GetHeader("Authorization")
@@ -170,9 +199,75 @@ func main() {
 		c.JSON(200, gin.H{"status": "OK", "uptime": time.Now().Unix()})
 	})
 
+	// Dashboard UI
+	r.GET("/admin", serveDashboard)
+	r.GET("/api/stats", serveStats)
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 	r.Run(":" + port)
+}
+
+func serveStats(c *gin.Context) {
+	var totalRequests int
+	var totalSavedUsd float64
+
+	db.QueryRow(`SELECT count(*), COALESCE(sum(saved_usd), 0) FROM prompt_cache`).Scan(&totalRequests, &totalSavedUsd)
+
+	c.JSON(200, gin.H{
+		"total_cached_prompts": totalRequests,
+		"total_saved_usd":      fmt.Sprintf("%.5f", totalSavedUsd),
+	})
+}
+
+func serveDashboard(c *gin.Context) {
+	html := `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AI Proxy - Financial Tracker</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-white min-h-screen flex items-center justify-center font-sans">
+    <div class="bg-gray-800 p-10 rounded-2xl shadow-2xl w-full max-w-lg text-center border border-gray-700">
+        <h1 class="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-green-400 to-blue-500 mb-6">
+            🤖 AI Cash Saver
+        </h1>
+        <p class="text-gray-400 mb-8">Tracking API cost savings via intelligent local hashing.</p>
+        
+        <div class="grid grid-cols-2 gap-6">
+            <div class="bg-gray-700 p-6 rounded-xl">
+                <p class="text-sm uppercase tracking-wide text-gray-400">Total Saves</p>
+                <div id="req-count" class="text-4xl font-black text-white mt-2">0</div>
+            </div>
+            <div class="bg-gray-700 p-6 rounded-xl border border-green-500/30 relative overflow-hidden">
+                <div class="absolute inset-0 bg-green-500/10 mix-blend-overlay"></div>
+                <p class="text-sm uppercase tracking-wide text-green-400 font-bold relative z-10">USD Saved 💰</p>
+                <div id="usd-count" class="text-4xl font-black text-green-400 mt-2 relative z-10">$0.00</div>
+            </div>
+        </div>
+
+        <button onclick="fetchStats()" class="mt-8 px-6 py-3 bg-blue-600 hover:bg-blue-500 transition-colors rounded-lg font-bold w-full">
+            Refresh Dashboard
+        </button>
+    </div>
+
+    <script>
+        async function fetchStats() {
+            try {
+                const res = await fetch('/api/stats');
+                const data = await res.json();
+                document.getElementById('req-count').innerText = data.total_cached_prompts;
+                document.getElementById('usd-count').innerText = '$' + data.total_saved_usd;
+            } catch (e) { console.error("API Error", e); }
+        }
+        fetchStats();
+        setInterval(fetchStats, 5000);
+    </script>
+</body>
+</html>`
+
+	c.Data(http.StatusOK, "text/html", []byte(html))
 }

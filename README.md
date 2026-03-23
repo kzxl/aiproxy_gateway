@@ -27,6 +27,8 @@ This Gateway intercepts your `POST /v1/chat/completions`:
 1. Hashes your entire JSON body.
 2. If it's a **Cache Hit**, returns the exact previous response instantly (Cost: $0.00, Time: 1ms).
 3. If it's a **Cache Miss**, forwards to OpenAI, returns the response, and silently caches it in a high-speed local SQLite database.
+4. **Token Cost Tracker**: Automatically intercepts `usage.total_tokens` and calculates exact USD $ saved per request.
+5. **Built-in HTML Dashboard**: Head to `http://localhost:8080/admin` to view a gorgeous UI tracking your lifetime savings!
 
 ### ⚡ Quick Start
 
@@ -82,6 +84,8 @@ Gateway này sẽ đánh chặn lệnh `POST /v1/chat/completions`:
 1. Tạo mã băm (Hash) toàn bộ nội dung JSON body của bạn.
 2. Nếu **Trúng Cache (Hit)**, trả về y hệt kết quả của lần trước ngay lập tức (Chi phí: $0.00, Thời gian: 1ms).
 3. Nếu **Trượt Cache (Miss)**, thay mặt bạn gọi tới OpenAI, hứng kết quả trả về, và âm thầm lưu nó vào cơ sở dữ liệu SQLite siêu tốc cục bộ.
+4. **Kế Toán Thông Minh (Token Tracker)**: Tự động phân tích trường `usage.total_tokens` và tính ra chuẩn xác số tiền Đô La ($) bạn vừa tiết kiệm được.
+5. **Giao Diện Dashboard Xịn Xò**: Truy cập `http://localhost:8080/admin` để ngắm nhìn bảng thống kê xịn xò bao gồm "Total Request" và "Total USD Saved 💰".
 
 ### ⚡ Hướng Dẫn Nhanh
 
